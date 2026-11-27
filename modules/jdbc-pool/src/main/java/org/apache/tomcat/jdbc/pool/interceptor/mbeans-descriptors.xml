@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+ Licensed to the Apache Software Foundation (ASF) under one or more
+  contributor license agreements.  See the NOTICE file distributed with
+  this work for additional information regarding copyright ownership.
+  The ASF licenses this file to You under the Apache License, Version 2.0
+  (the "License"); you may not use this file except in compliance with
+  the License.  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+-->
+<!DOCTYPE mbeans-descriptors PUBLIC
+   "-//Apache Software Foundation//DTD Model MBeans Configuration File"
+   "http://jakarta.apache.org/commons/dtds/mbeans-descriptors.dtd">
+<mbeans-descriptors>
+
+  <mbean description="Reports slow and failed queries through JMX and publishes the statistics of the pool that registered it" domain="tomcat.jdbc" group="jdbc-pool" name="SlowQueryReportJmx"
+         type="org.apache.tomcat.jdbc.pool.interceptor.SlowQueryReportJmx">
+
+    <attribute description="The name of the connection pool this Jmx bean is representing" name="PoolName" type="java.lang.String" writeable="false"/>
+    <attribute description="Names of the pools that currently publish recorded statistics in this JVM" name="PoolNames" type="[Ljava.lang.String;" writeable="false"/>
+    <attribute description="All the recorded query stats, as one CompositeData per recorded query" name="SlowQueriesCD" type="[Ljavax.management.openmbean.CompositeData;" writeable="false"/>
+
+    <!-- The notification-type values are the wire types of the notifications the MBean
+         sends; they must stay equal to the SLOW_QUERY_NOTIFICATION and
+         FAILED_QUERY_NOTIFICATION constants, which is pinned by the surface test. -->
+    <notification description="Notification sent out by the slow query report when a query exceeds the threshold" name="SLOW QUERY">
+      <notification-type>SLOW QUERY</notification-type>
+    </notification>
+
+    <notification description="Notification sent out by the slow query report when a query fails execution" name="FAILED QUERY">
+      <notification-type>FAILED QUERY</notification-type>
+    </notification>
+
+    <operation description="Clears all the query stats" impact="ACTION" name="resetStats" returnType="void"/>
+  </mbean>
+</mbeans-descriptors>

@@ -1,0 +1,438 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.catalina.webresources;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.URL;
+import java.util.ArrayList;
+import java.util.Map;
+import java.util.Set;
+import java.util.jar.JarEntry;
+import java.util.jar.JarFile;
+import java.util.jar.Manifest;
+import java.util.zip.ZipFile;
+
+import org.apache.catalina.WebResource;
+import org.apache.catalina.WebResourceRoot;
+import org.apache.catalina.util.ResourceSet;
+import org.apache.juli.logging.Log;
+import org.apache.juli.logging.LogFactory;
+
+/**
+ * Abstract resource set implementation for archive-based resources.
+ */
+public abstract class AbstractArchiveResourceSet extends AbstractResourceSet {
+
+    /**
+     * Constructs a new abstract archive resource set.
+     */
+    protected AbstractArchiveResourceSet() {
+        super();
+    }
+
+    private static final Log log = LogFactory.getLog(AbstractArchiveResourceSet.class);
+
+    private URL baseUrl;
+    private String baseUrlString;
+    /**
+     * The archive JAR file.
+     */
+    protected JarFile archive = null;
+    /**
+     * The archive entries.
+     */
+    protected Map<String,JarEntry> archiveEntries = null;
+    /**
+     * The lock for archive operations.
+     */
+    protected final Object archiveLock = new Object();
+    /**
+     * The archive use count.
+     */
+    protected long archiveUseCount = 0;
+    /**
+     * The JAR contents. Written under {@code archiveLock} but read without
+     * locking in {@code getResource()}, so the field is volatile to ensure a
+     * fully constructed instance is published to readers.
+     */
+    protected volatile JarContents jarContents;
+    /**
+     * Whether to retain the bloom filter for archives.
+     */
+    protected boolean retainBloomFilterForArchives = false;
+
+    /**
+     * Sets the base URL.
+     *
+     * @param baseUrl The base URL
+     */
+    protected final void setBaseUrl(URL baseUrl) {
+        this.baseUrl = baseUrl;
+        if (baseUrl == null) {
+            this.baseUrlString = null;
+        } else {
+            this.baseUrlString = baseUrl.toString();
+        }
+    }
+
+    @Override
+    public final URL getBaseUrl() {
+        return baseUrl;
+    }
+
+    /**
+     * Returns the base URL string.
+     *
+     * @return the base URL string
+     */
+    protected final String getBaseUrlString() {
+        return baseUrlString;
+    }
+
+
+    @Override
+    public final String[] list(String path) {
+        checkPath(path);
+        String webAppMount = getWebAppMount();
+
+        ArrayList<String> result = new ArrayList<>();
+        if (isPathMounted(path, webAppMount)) {
+            String pathInJar = getInternalPath() + path.substring(webAppMount.length());
+            // Always strip off the leading '/' to get the JAR path
+            if (!pathInJar.isEmpty() && pathInJar.charAt(0) == '/') {
+                pathInJar = pathInJar.substring(1);
+            }
+            Map<String, JarEntry> archiveEntries = getArchiveEntries(false);
+            if (archiveEntries != null) {
+                for (String name : archiveEntries.keySet()) {
+                    if (name.length() > pathInJar.length() && name.startsWith(pathInJar)) {
+                        if (name.charAt(name.length() - 1) == '/') {
+                            name = name.substring(pathInJar.length(), name.length() - 1);
+                        } else {
+                            name = name.substring(pathInJar.length());
+                        }
+                        if (name.isEmpty()) {
+                            continue;
+                        }
+                        if (name.charAt(0) == '/') {
+                            name = name.substring(1);
+                        }
+                        if (!name.isEmpty() && name.lastIndexOf('/') == -1) {
+                            result.add(name);
+                        }
+                    }
+                }
+            }
+        } else {
+            if (!path.endsWith("/")) {
+                path = path + "/";
+            }
+            if (webAppMount.startsWith(path)) {
+                int i = webAppMount.indexOf('/', path.length());
+                if (i == -1) {
+                    return new String[] { webAppMount.substring(path.length()) };
+                } else {
+                    return new String[] { webAppMount.substring(path.length(), i) };
+                }
+            }
+        }
+        return result.toArray(new String[0]);
+    }
+
+
+    @Override
+    public final Set<String> listWebAppPaths(String path) {
+        checkPath(path);
+        String webAppMount = getWebAppMount();
+
+        ResourceSet<String> result = new ResourceSet<>();
+        if (isPathMounted(path, webAppMount)) {
+            String pathInJar = getInternalPath() + path.substring(webAppMount.length());
+            // Always strip off the leading '/' to get the JAR path and make
+            // sure it ends in '/'
+            if (!pathInJar.isEmpty()) {
+                if (pathInJar.charAt(pathInJar.length() - 1) != '/') {
+                    pathInJar = pathInJar.substring(1) + '/';
+                }
+                if (pathInJar.charAt(0) == '/') {
+                    pathInJar = pathInJar.substring(1);
+                }
+            }
+
+            Map<String, JarEntry> archiveEntries = getArchiveEntries(false);
+            if (archiveEntries != null) {
+                for (String name : archiveEntries.keySet()) {
+                    if (name.length() > pathInJar.length() && name.startsWith(pathInJar)) {
+                        int nextSlash = name.indexOf('/', pathInJar.length());
+                        if (nextSlash != -1 && nextSlash != name.length() - 1) {
+                            name = name.substring(0, nextSlash + 1);
+                        }
+                        result.add(webAppMount + '/' + name.substring(getInternalPath().length()));
+                    }
+                }
+            }
+        } else {
+            if (!path.endsWith("/")) {
+                path = path + "/";
+            }
+            if (webAppMount.startsWith(path)) {
+                int i = webAppMount.indexOf('/', path.length());
+                if (i == -1) {
+                    result.add(webAppMount + "/");
+                } else {
+                    result.add(webAppMount.substring(0, i + 1));
+                }
+            }
+        }
+        result.setLocked(true);
+        return result;
+    }
+
+
+    /**
+     * Obtain the map of entries in the archive. May return null in which case {@link #getArchiveEntry(String)} should
+     * be used.
+     *
+     * @param single Is this request being make to support a single lookup? If false, a map will always be returned. If
+     *                   true, implementations may use this as a hint in determining the optimum way to respond.
+     *
+     * @return The archives entries mapped to their names or null if {@link #getArchiveEntry(String)} should be used.
+     */
+    protected abstract Map<String,JarEntry> getArchiveEntries(boolean single);
+
+
+    /**
+     * Obtain a single entry from the archive. For performance reasons, {@link #getArchiveEntries(boolean)} should
+     * always be called first and the archive entry looked up in the map if one is returned. Only if that call returns
+     * null should this method be used.
+     *
+     * @param pathInArchive The path in the archive of the entry required
+     *
+     * @return The specified archive entry or null if it does not exist
+     */
+    protected abstract JarEntry getArchiveEntry(String pathInArchive);
+
+    @Override
+    public final boolean mkdir(String path) {
+        checkPath(path);
+
+        return false;
+    }
+
+    @Override
+    public final boolean write(String path, InputStream is, boolean overwrite) {
+        checkPath(path);
+
+        if (is == null) {
+            throw new NullPointerException(sm.getString("dirResourceSet.writeNpe"));
+        }
+
+        return false;
+    }
+
+    @Override
+    public final WebResource getResource(String path) {
+        checkPath(path);
+        String webAppMount = getWebAppMount();
+        WebResourceRoot root = getRoot();
+
+        /*
+         * Implementation notes
+         *
+         * The path parameter passed into this method always starts with '/'.
+         *
+         * The path parameter passed into this method may or may not end with a '/'. JarFile.getEntry() will return a
+         * matching directory entry whether or not the name ends in a '/'. However, if the entry is requested without
+         * the '/' subsequent calls to JarEntry.isDirectory() will return false.
+         *
+         * Paths in JARs never start with '/'. Leading '/' need to be removed before any JarFile.getEntry() call.
+         */
+
+        // If the JAR has been mounted below the web application root, return
+        // an empty resource for requests outside of the mount point.
+
+        if (isPathMounted(path, webAppMount)) {
+            String pathSuffix = path.substring(webAppMount.length());
+
+            // If the requested path is the mount point itself, the requested
+            // resource is the root of the path in the archive that this set
+            // maps to the mount point. Always treat it as a directory
+            // resource, represented by the archive root rather than by a
+            // (possibly absent) directory entry in the archive.
+            if (pathSuffix.isEmpty() || pathSuffix.equals("/")) {
+                // This is a directory resource so the path must end with /
+                if (!path.endsWith("/")) {
+                    path = path + "/";
+                }
+                return new JarResourceRoot(root, new File(getBase()), baseUrlString, path, getInternalPath());
+            }
+
+            String pathInJar = getInternalPath() + pathSuffix;
+            // Always strip off the leading '/' to get the JAR path
+            if (!pathInJar.isEmpty() && pathInJar.charAt(0) == '/') {
+                pathInJar = pathInJar.substring(1);
+            }
+
+            /*
+             * If jarContents reports that this resource definitely does not contain the path, we can end this method
+             * and move on to the next jar. The bloom filter is keyed on the entry names in the archive, so the
+             * pre-check must use the JAR relative path. Hashing the web application path (with the mount point
+             * embedded in it) would result in false negatives.
+             */
+            JarContents contents = jarContents;
+            if (contents != null && !contents.mightContainResource(pathInJar)) {
+                return new EmptyResource(root, path);
+            }
+
+            JarEntry jarEntry = null;
+            if (isMultiRelease()) {
+                // Calls JarFile.getJarEntry() which is multi-release aware
+                jarEntry = getArchiveEntry(pathInJar);
+            } else {
+                Map<String,JarEntry> jarEntries = getArchiveEntries(true);
+                if (!(pathInJar.charAt(pathInJar.length() - 1) == '/')) {
+                    if (jarEntries == null) {
+                        jarEntry = getArchiveEntry(pathInJar + '/');
+                    } else {
+                        jarEntry = jarEntries.get(pathInJar + '/');
+                    }
+                    if (jarEntry != null) {
+                        path = path + '/';
+                    }
+                }
+                if (jarEntry == null) {
+                    if (jarEntries == null) {
+                        jarEntry = getArchiveEntry(pathInJar);
+                    } else {
+                        jarEntry = jarEntries.get(pathInJar);
+                    }
+                }
+            }
+            if (jarEntry == null) {
+                return new EmptyResource(root, path);
+            } else {
+                return createArchiveResource(jarEntry, path, getManifest());
+            }
+        } else {
+            return new EmptyResource(root, path);
+        }
+    }
+
+    /**
+     * Checks if this is a multi-release JAR.
+     *
+     * @return true if this is a multi-release JAR, false otherwise
+     */
+    protected abstract boolean isMultiRelease();
+
+    /**
+     * Creates an archive resource.
+     *
+     * @param jarEntry   The JAR entry
+     * @param webAppPath The web application path
+     * @param manifest   The manifest
+     * @return the archive resource
+     */
+    protected abstract WebResource createArchiveResource(JarEntry jarEntry, String webAppPath, Manifest manifest);
+
+    @Override
+    public final boolean isReadOnly() {
+        return true;
+    }
+
+    @Override
+    public void setReadOnly(boolean readOnly) {
+        if (readOnly) {
+            // This is the hard-coded default - ignore the call
+            return;
+        }
+
+        throw new IllegalArgumentException(sm.getString("abstractArchiveResourceSet.setReadOnlyFalse"));
+    }
+
+    /**
+     * {@inheritDoc}
+     * <p>
+     * Calls to this method will be ignored as archives do not allow linking.
+     */
+    @Override
+    public void setAllowLinking(boolean allowLinking) {
+        // NO-OP
+    }
+
+    /**
+     * {@inheritDoc}
+     * <p>
+     * Calls to this method always return {@code false} as archives do not allow linking.
+     */
+    @Override
+    public boolean getAllowLinking() {
+        return false;
+    }
+
+    /**
+     * Create a JarFile for accessing the elements of the resource set. Depending on the
+     * {@link WebResourceRoot#getArchiveIndexStrategy()}, it may also index the elements for faster lookups.
+     *
+     * @return A JarFile to use to access the elements of the resource set
+     *
+     * @throws IOException If an error occurs creating the JarFile
+     */
+    protected JarFile openJarFile() throws IOException {
+        synchronized (archiveLock) {
+            if (archive == null) {
+                archive = new JarFile(new File(getBase()), true, ZipFile.OPEN_READ, Runtime.version());
+                WebResourceRoot root = getRoot();
+                if (root.getArchiveIndexStrategyEnum().getUsesBloom()) {
+                    jarContents = new JarContents(archive);
+                    retainBloomFilterForArchives = root.getArchiveIndexStrategyEnum().getRetain();
+                }
+            }
+            archiveUseCount++;
+            return archive;
+        }
+    }
+
+    /**
+     * Closes the JAR file.
+     */
+    protected void closeJarFile() {
+        synchronized (archiveLock) {
+            archiveUseCount--;
+        }
+    }
+
+    @Override
+    public void gc() {
+        synchronized (archiveLock) {
+            if (archive != null && archiveUseCount == 0) {
+                try {
+                    archive.close();
+                } catch (IOException ioe) {
+                    log.warn(sm.getString("abstractArchiveResourceSet.archiveCloseFailed"), ioe);
+                }
+                archive = null;
+                archiveEntries = null;
+                if (!retainBloomFilterForArchives) {
+                    jarContents = null;
+                }
+            }
+        }
+    }
+}

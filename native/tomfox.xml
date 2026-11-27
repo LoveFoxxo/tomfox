@@ -1,0 +1,139 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one or more
+  contributor license agreements.  See the NOTICE file distributed with
+  this work for additional information regarding copyright ownership.
+  The ASF licenses this file to You under the Apache License, Version 2.0
+  (the "License"); you may not use this file except in compliance with
+  the License.  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+-->
+<project name="tomfox-native">
+  <property name="tomfox.output" value="${tomcat.output}/tomfox" />
+  <property name="tomfox.native.output" value="${tomcat.output}/native" />
+  <property name="tomfox.native.cl" value="cl" />
+  <property name="tomfox.native.cc" value="cc" />
+
+  <condition property="tomfox.native.windows"><os family="windows" /></condition>
+  <condition property="tomfox.native.linux"><os name="Linux" /></condition>
+
+  <target name="-tomfox-native-windows" if="tomfox.native.windows">
+    <property name="tomfox.native.file" value="${tomfox.native.output}/tomfox-hpack.dll" />
+    <mkdir dir="${tomfox.native.output}" />
+    <exec executable="${tomfox.native.cl}" failonerror="true">
+      <arg value="/nologo" />
+      <arg value="/TC" />
+      <arg value="/std:c11" />
+      <arg value="/O2" />
+      <arg value="/GS" />
+      <arg value="/W4" />
+      <arg value="/WX" />
+      <arg value="/LD" />
+      <arg value="/I${java.home}/include" />
+      <arg value="/I${java.home}/include/win32" />
+      <arg value="/Fo:${tomfox.native.output}/tomfox-hpack.obj" />
+      <arg value="${basedir}/native/tomfox_hpack.c" />
+      <arg value="/link" />
+      <arg value="/OUT:${tomfox.native.file}" />
+      <arg value="/IMPLIB:${tomfox.native.output}/tomfox-hpack.lib" />
+      <arg value="/DYNAMICBASE" />
+      <arg value="/NXCOMPAT" />
+      <arg value="/guard:cf" />
+    </exec>
+  </target>
+
+  <target name="-tomfox-native-linux" if="tomfox.native.linux">
+    <property name="tomfox.native.file" value="${tomfox.native.output}/libtomfox-hpack.so" />
+    <mkdir dir="${tomfox.native.output}" />
+    <exec executable="${tomfox.native.cc}" failonerror="true">
+      <arg value="-O3" />
+      <arg value="-std=c11" />
+      <arg value="-fPIC" />
+      <arg value="-fvisibility=hidden" />
+      <arg value="-Wall" />
+      <arg value="-Wextra" />
+      <arg value="-Werror" />
+      <arg value="-shared" />
+      <arg value="-I${java.home}/include" />
+      <arg value="-I${java.home}/include/linux" />
+      <arg value="-Wl,--no-undefined" />
+      <arg value="-Wl,-z,relro,-z,now" />
+      <arg value="-o" />
+      <arg value="${tomfox.native.file}" />
+      <arg value="${basedir}/native/tomfox_hpack.c" />
+    </exec>
+  </target>
+
+  <target name="build-tomfox-native" depends="-tomfox-native-windows,-tomfox-native-linux">
+    <fail message="Tomfox native builds currently require Windows/MSVC or Linux with a C11 compiler.">
+      <condition><not><isset property="tomfox.native.file" /></not></condition>
+    </fail>
+    <available file="${tomfox.native.file}" property="tomfox.native.built" />
+    <fail unless="tomfox.native.built" message="Native HPACK library was not produced." />
+  </target>
+
+  <target name="-tomfox-download-native-tls" if="tomfox.native.windows">
+    <antcall target="downloadzip-2">
+      <param name="sourcefile.1" value="${tomcat-native.win.1}" />
+      <param name="sourcefile.2" value="${tomcat-native.win.2}" />
+      <param name="destfile" value="${tomcat-native.home}/LICENSE" />
+      <param name="destdir" value="${tomcat-native.home}" />
+      <param name="checksum.enabled" value="${tomcat-native.win.checksum.enabled}" />
+      <param name="checksum.algorithm" value="${tomcat-native.win.checksum.algorithm}" />
+      <param name="checksum.value" value="${tomcat-native.win.checksum.value}" />
+    </antcall>
+  </target>
+
+  <target name="-tomfox-copy-native-tls" if="tomfox.native.windows">
+    <copy todir="${tomfox.output}/bin">
+      <fileset dir="${tomcat-native.home}/bin/x64"><include name="*.dll" /></fileset>
+    </copy>
+    <copy file="${tomcat-native.home}/LICENSE" tofile="${tomfox.output}/bin/tomcat-native-LICENSE.txt"
+        failonerror="false" />
+  </target>
+
+  <target name="tomfox" depends="deploy,build-tomfox-native,-tomfox-download-native-tls"
+      description="Build the native, reduced Tomfox runtime without modifying the full test runtime">
+    <delete dir="${tomfox.output}" />
+    <copy todir="${tomfox.output}">
+      <fileset dir="${tomcat.build}">
+        <exclude name="logs/**" />
+        <exclude name="temp/**" />
+        <exclude name="work/**" />
+        <exclude name="webapps/**" />
+        <exclude name="webapps-javaee/**" />
+        <exclude name="lib/catalina-ant.jar" />
+        <exclude name="lib/catalina-ha.jar" />
+        <exclude name="lib/catalina-ssi.jar" />
+        <exclude name="lib/catalina-storeconfig.jar" />
+        <exclude name="lib/catalina-tribes.jar" />
+        <exclude name="lib/jakartaee-migration-*.jar" />
+        <exclude name="lib/tomcat-coyote-ffm.jar" />
+        <exclude name="bin/catalina-tasks.xml" />
+        <exclude name="bin/migrate.bat" />
+        <exclude name="bin/migrate.sh" />
+      </fileset>
+    </copy>
+    <copy file="${basedir}/native/tomfox.logging.properties"
+        tofile="${tomfox.output}/conf/logging.properties" overwrite="true" />
+    <replace file="${tomfox.output}/conf/server.xml">
+      <replacefilter token='unpackWARs="true" autoDeploy="true"'
+          value='unpackWARs="false" autoDeploy="false"' />
+      <replacefilter token='unpackWARs="false" autoDeploy="false"&gt;'
+          value='unpackWARs="false" autoDeploy="false"&gt;&#10;        &lt;Valve className="org.apache.catalina.valves.JsonErrorReportValve" showReport="false" showServerInfo="false" /&gt;' />
+    </replace>
+    <mkdir dir="${tomfox.output}/logs" />
+    <mkdir dir="${tomfox.output}/temp" />
+    <mkdir dir="${tomfox.output}/webapps" />
+    <mkdir dir="${tomfox.output}/work" />
+    <copy file="${tomfox.native.file}" todir="${tomfox.output}/bin" />
+    <antcall target="-tomfox-copy-native-tls" />
+  </target>
+</project>

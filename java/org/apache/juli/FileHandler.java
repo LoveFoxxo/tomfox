@@ -1,0 +1,641 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.juli;
+
+import java.io.BufferedOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.io.OutputStreamWriter;
+import java.io.PrintWriter;
+import java.io.UnsupportedEncodingException;
+import java.nio.file.DirectoryStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.sql.Timestamp;
+import java.time.DateTimeException;
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.logging.ErrorManager;
+import java.util.logging.Filter;
+import java.util.logging.Formatter;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogManager;
+import java.util.logging.LogRecord;
+import java.util.regex.Pattern;
+
+/**
+ * Implementation of <b>Handler</b> that appends log messages to a file named {prefix}{date}{suffix} in a configured
+ * directory.
+ * <p>
+ * The following configuration properties are available:
+ * </p>
+ * <ul>
+ * <li><code>directory</code> - The directory where to create the log file. If the path is not absolute, it is relative
+ * to the current working directory of the application. The Apache Tomcat configuration files usually specify an
+ * absolute path for this property, <code>${catalina.base}/logs</code> Default value: <code>logs</code></li>
+ * <li><code>rotatable</code> - If <code>true</code>, the log file will be rotated on the first write past midnight and
+ * the filename will be <code>{prefix}{date}{suffix}</code>, where date is yyyy-MM-dd. If <code>false</code>, the file
+ * will not be rotated and the filename will be <code>{prefix}{suffix}</code>. Default value: <code>true</code></li>
+ * <li><code>prefix</code> - The leading part of the log file name. Default value: <code>juli.</code></li>
+ * <li><code>suffix</code> - The trailing part of the log file name. Default value: <code>.log</code></li>
+ * <li><code>bufferSize</code> - Configures buffering. The value of <code>0</code> uses no application-level buffering.
+ * A value of <code>&lt;0</code> forces a writer flush upon each log write. A
+ * value <code>&gt;0</code> uses a BufferedOutputStream with the defined value but note that the system default
+ * buffering will also be applied. Default value: <code>-1</code></li>
+ * <li><code>encoding</code> - Character set used by the log file. Default value: empty string, which means to use the
+ * system default character set.</li>
+ * <li><code>level</code> - The level threshold for this Handler. See the <code>java.util.logging.Level</code> class for
+ * the possible levels. Default value: <code>ALL</code></li>
+ * <li><code>filter</code> - The <code>java.util.logging.Filter</code> implementation class name for this Handler.
+ * Default value: unset</li>
+ * <li><code>formatter</code> - The <code>java.util.logging.Formatter</code> implementation class name for this Handler.
+ * Default value: <code>org.apache.juli.OneLineFormatter</code></li>
+ * <li><code>maxDays</code> - The maximum number of days to keep the log files. If the specified value is
+ * <code>&lt;=0</code> then the log files will be kept on the file system forever, otherwise they will be kept the
+ * specified maximum days. Default value: <code>-1</code>.</li>
+ * </ul>
+ */
+public class FileHandler extends Handler {
+
+
+    /**
+     * Default value for the maximum number of days to keep log files. A value of -1 means unlimited.
+     */
+    public static final int DEFAULT_MAX_DAYS = -1;
+    /**
+     * Default value for the log buffer size. A value of -1 forces a flush on each write.
+     */
+    public static final int DEFAULT_BUFFER_SIZE = -1;
+
+
+    private static final ExecutorService DELETE_FILES_SERVICE =
+            Executors.newSingleThreadExecutor(new ThreadFactory("FileHandlerLogFilesCleaner-"));
+
+    // ------------------------------------------------------------ Constructor
+
+
+    /**
+     * Default constructor. Uses LogManager properties for all configuration.
+     */
+    public FileHandler() {
+        this(null, null, null);
+    }
+
+
+    /**
+     * Constructor with directory, prefix, and suffix.
+     *
+     * @param directory The directory where log files are created
+     * @param prefix The leading part of the log file name
+     * @param suffix The trailing part of the log file name
+     */
+    public FileHandler(String directory, String prefix, String suffix) {
+        this(directory, prefix, suffix, null);
+    }
+
+
+    /**
+     * Constructor with directory, prefix, suffix, and maxDays.
+     *
+     * @param directory The directory where log files are created
+     * @param prefix The leading part of the log file name
+     * @param suffix The trailing part of the log file name
+     * @param maxDays The maximum number of days to keep log files
+     */
+    public FileHandler(String directory, String prefix, String suffix, Integer maxDays) {
+        this(directory, prefix, suffix, maxDays, null, null);
+    }
+
+
+    /**
+     * Constructor with all configuration options.
+     *
+     * @param directory The directory where log files are created
+     * @param prefix The leading part of the log file name
+     * @param suffix The trailing part of the log file name
+     * @param maxDays The maximum number of days to keep log files
+     * @param rotatable Whether the log file is rotatable
+     * @param bufferSize The log buffer size
+     */
+    public FileHandler(String directory, String prefix, String suffix, Integer maxDays, Boolean rotatable,
+            Integer bufferSize) {
+        this.directory = directory;
+        this.prefix = prefix;
+        this.suffix = suffix;
+        this.maxDays = maxDays;
+        this.rotatable = rotatable;
+        this.bufferSize = bufferSize;
+        configure();
+        clean();
+    }
+
+
+    // ----------------------------------------------------- Instance Variables
+
+
+    /**
+     * The as-of date for the currently open log file, or null if there is no open log file.
+     */
+    private volatile String date = null;
+
+
+    /**
+     * The directory in which log files are created.
+     */
+    private String directory;
+
+
+    /**
+     * The prefix that is added to log file filenames.
+     */
+    private String prefix;
+
+
+    /**
+     * The suffix that is added to log file filenames.
+     */
+    private String suffix;
+
+
+    /**
+     * Determines whether the log file is rotatable
+     */
+    private Boolean rotatable;
+
+
+    /**
+     * Maximum number of days to keep the log files
+     */
+    private Integer maxDays;
+
+
+    /**
+     * The PrintWriter to which we are currently logging, if any.
+     */
+    private volatile PrintWriter writer = null;
+
+
+    /**
+     * Lock used to control access to the writer.
+     */
+    protected final ReadWriteLock writerLock = new ReentrantReadWriteLock();
+
+
+    /**
+     * Log buffer size.
+     */
+    private Integer bufferSize;
+
+
+    /**
+     * Represents a file name pattern of type {prefix}{date}{suffix}. The date is YYYY-MM-DD
+     */
+    private Pattern pattern;
+
+
+    // --------------------------------------------------------- Public Methods
+
+
+    /**
+     * Format and publish a <code>LogRecord</code>.
+     *
+     * @param record description of the log event
+     */
+    @Override
+    public void publish(LogRecord record) {
+
+        if (!isLoggable(record)) {
+            return;
+        }
+
+        final String tsDate;
+        if (rotatable.booleanValue()) {
+            tsDate = obtainCurrentDate();
+        } else {
+            tsDate = "";
+        }
+
+        String result;
+        try {
+            result = getFormatter().format(record);
+        } catch (Exception e) {
+            reportError(null, e, ErrorManager.FORMAT_FAILURE);
+            return;
+        }
+
+        writerLock.readLock().lock();
+        try {
+            // If the date has changed, switch log files
+            if (!tsDate.equals(date)) {
+                // Upgrade to writeLock before we switch
+                writerLock.readLock().unlock();
+                writerLock.writeLock().lock();
+                try {
+                    // Make sure another thread hasn't already done this
+                    if (!tsDate.equals(date)) {
+                        closeWriter();
+                        date = tsDate;
+                        openWriter();
+                        clean();
+                    }
+                } finally {
+                    // Downgrade to read-lock. This ensures the writer remains valid
+                    // until the log message is written
+                    writerLock.readLock().lock();
+                    writerLock.writeLock().unlock();
+                }
+            }
+
+            try {
+                if (writer != null) {
+                    writer.write(result);
+                    if (bufferSize.intValue() < 0) {
+                        writer.flush();
+                        // PrintWriter swallows the exceptions from the underlying stream instead of
+                        // propagating them, so the error flag needs to be checked explicitly after the
+                        // flush. Throwing below discards the writer and lets a later record open a new
+                        // one, as the next record will find the date unset and re-open the file.
+                        if (writer.checkError()) {
+                            throw new IOException("Unable to write to the log file");
+                        }
+                    }
+                } else {
+                    reportError("FileHandler is closed or not yet initialized, unable to log [" + result + "]", null,
+                            ErrorManager.WRITE_FAILURE);
+                }
+            } catch (Exception e) {
+                reportError(null, e, ErrorManager.WRITE_FAILURE);
+                // Discard the writer, so the next record attempts to reopen the file rather than
+                // remaining attached to a writer that can no longer complete writes
+                writerLock.readLock().unlock();
+                try {
+                    closeWriter();
+                } finally {
+                    writerLock.readLock().lock();
+                }
+            }
+        } finally {
+            writerLock.readLock().unlock();
+        }
+    }
+
+
+    // -------------------------------------------------------- Private Methods
+
+
+    /**
+     * Close the currently open log file (if any).
+     */
+    @Override
+    public void close() {
+        closeWriter();
+    }
+
+    /**
+     * Close the currently open log file writer.
+     */
+    protected void closeWriter() {
+
+        writerLock.writeLock().lock();
+        try {
+            if (writer == null) {
+                return;
+            }
+            try {
+                writer.write(getFormatter().getTail(this));
+                writer.flush();
+            } catch (Exception e) {
+                reportError(null, e, ErrorManager.CLOSE_FAILURE);
+            } finally {
+                // The writer is closed and discarded even when the tail could not be written, so a
+                // failure is not repeated by every later close() for a writer that is never released
+                try {
+                    writer.close();
+                } catch (Exception e) {
+                    reportError(null, e, ErrorManager.CLOSE_FAILURE);
+                }
+                writer = null;
+                date = null;
+            }
+        } finally {
+            writerLock.writeLock().unlock();
+        }
+    }
+
+
+    /**
+     * Flush the writer.
+     */
+    @Override
+    public void flush() {
+
+        writerLock.readLock().lock();
+        try {
+            if (writer == null) {
+                return;
+            }
+            writer.flush();
+        } catch (Exception e) {
+            reportError(null, e, ErrorManager.FLUSH_FAILURE);
+        } finally {
+            writerLock.readLock().unlock();
+        }
+
+    }
+
+
+    /**
+     * Configure from <code>LogManager</code> properties.
+     */
+    private void configure() {
+
+        String className = this.getClass().getName(); // allow classes to override
+
+        ClassLoader cl = ClassLoaderLogManager.getClassLoader();
+
+        // Retrieve configuration of logging file name
+        if (rotatable == null) {
+            rotatable = Boolean.valueOf(getProperty(className + ".rotatable", "true"));
+        }
+        if (directory == null) {
+            directory = getProperty(className + ".directory", "logs");
+        }
+        if (prefix == null) {
+            prefix = getProperty(className + ".prefix", "juli.");
+        }
+        if (suffix == null) {
+            suffix = getProperty(className + ".suffix", ".log");
+        }
+
+        // https://bz.apache.org/bugzilla/show_bug.cgi?id=61232
+        boolean shouldCheckForRedundantSeparator = !rotatable.booleanValue() && !prefix.isEmpty() && !suffix.isEmpty();
+        // assuming separator is just one char, if there are use cases with
+        // more, the notion of separator might be introduced
+        if (shouldCheckForRedundantSeparator && (prefix.charAt(prefix.length() - 1) == suffix.charAt(0))) {
+            suffix = suffix.substring(1);
+        }
+
+        pattern = Pattern
+                .compile("^(" + Pattern.quote(prefix) + ")\\d{4}-\\d{1,2}-\\d{1,2}(" + Pattern.quote(suffix) + ")$");
+
+        if (maxDays == null) {
+            String sMaxDays = getProperty(className + ".maxDays", String.valueOf(DEFAULT_MAX_DAYS));
+            try {
+                maxDays = Integer.valueOf(sMaxDays);
+            } catch (NumberFormatException ignore) {
+                maxDays = Integer.valueOf(DEFAULT_MAX_DAYS);
+            }
+        }
+
+        if (bufferSize == null) {
+            String sBufferSize = getProperty(className + ".bufferSize", String.valueOf(DEFAULT_BUFFER_SIZE));
+            try {
+                bufferSize = Integer.valueOf(sBufferSize);
+            } catch (NumberFormatException ignore) {
+                bufferSize = Integer.valueOf(DEFAULT_BUFFER_SIZE);
+            }
+        }
+
+        // Get encoding for the logging file
+        String encoding = getProperty(className + ".encoding", null);
+        if (encoding != null && !encoding.isEmpty()) {
+            try {
+                setEncoding(encoding);
+            } catch (UnsupportedEncodingException ignore) {
+                // Ignore
+            }
+        }
+
+        // Get logging level for the handler
+        setLevel(Level.parse(getProperty(className + ".level", "" + Level.ALL)));
+
+        // Get filter configuration
+        String filterName = getProperty(className + ".filter", null);
+        if (filterName != null) {
+            try {
+                setFilter((Filter) cl.loadClass(filterName).getConstructor().newInstance());
+            } catch (Exception ignore) {
+                // Ignore
+            }
+        }
+
+        // Set formatter
+        String formatterName = getProperty(className + ".formatter", null);
+        if (formatterName != null) {
+            try {
+                setFormatter((Formatter) cl.loadClass(formatterName).getConstructor().newInstance());
+            } catch (Exception ignore) {
+                // Ignore and fallback to defaults
+                setFormatter(new OneLineFormatter());
+            }
+        } else {
+            setFormatter(new OneLineFormatter());
+        }
+
+        // Logging failures must not recursively use the logging system or JUL's non-JSON console format.
+        setErrorManager(new ErrorManager() {
+            @Override
+            public void error(String message, Exception exception, int code) {
+                org.apache.juli.logging.LogHub.reportInternal(Level.SEVERE, FileHandler.this.getClass().getName(),
+                        "error", message == null ? "Log handler failure [" + code + "]" : message, exception);
+            }
+        });
+    }
+
+
+    private String getProperty(String name, String defaultValue) {
+        String value = LogManager.getLogManager().getProperty(name);
+        if (value == null) {
+            value = defaultValue;
+        } else {
+            value = value.strip();
+        }
+        return value;
+    }
+
+
+    /**
+     * Open the new log file. If the handler is rotatable and no date has been set yet, the log file for the current
+     * date is opened.
+     */
+    public void open() {
+        openWriter();
+    }
+
+    /**
+     * Open the writer for the current log file.
+     */
+    protected void openWriter() {
+
+        // Create the directory if necessary
+        File dir = new File(directory);
+        if (!dir.mkdirs() && !dir.isDirectory()) {
+            reportError("Unable to create [" + dir + "]", null, ErrorManager.OPEN_FAILURE);
+            writer = null;
+            return;
+        }
+
+        // Open the current log file
+        writerLock.writeLock().lock();
+        FileOutputStream fos = null;
+        OutputStream os = null;
+        try {
+            // If no date has been set, typically because the handler has been opened before any record was
+            // published, use the current date, as publish() does when it rotates the log file, so the file
+            // name always matches the pattern used for rotation and cleanup
+            String currentDate = date;
+            boolean dateComputed = rotatable.booleanValue() && currentDate == null;
+            if (dateComputed) {
+                currentDate = obtainCurrentDate();
+            }
+            File pathname = new File(dir.getAbsoluteFile(),
+                    prefix + (rotatable.booleanValue() ? currentDate : "") + suffix);
+            File parent = pathname.getParentFile();
+            if (!parent.mkdirs() && !parent.isDirectory()) {
+                reportError("Unable to create [" + parent + "]", null, ErrorManager.OPEN_FAILURE);
+                writer = null;
+                return;
+            }
+            String encoding = getEncoding();
+            fos = new FileOutputStream(pathname, true);
+            os = bufferSize.intValue() > 0 ? new BufferedOutputStream(fos, bufferSize.intValue()) : fos;
+            writer = new PrintWriter(
+                    (encoding != null) ? new OutputStreamWriter(os, encoding) : new OutputStreamWriter(os), false);
+            writer.write(getFormatter().getHead(this));
+            if (dateComputed) {
+                date = currentDate;
+            }
+        } catch (Exception e) {
+            reportError(null, e, ErrorManager.OPEN_FAILURE);
+            writer = null;
+            if (fos != null) {
+                try {
+                    fos.close();
+                } catch (IOException ignore) {
+                    // Ignore
+                }
+            }
+            if (os != null) {
+                try {
+                    os.close();
+                } catch (IOException ignore) {
+                    // Ignore
+                }
+            }
+        } finally {
+            writerLock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Obtain the date string used as the date part of the names of the rotatable log files.
+     *
+     * @return The current date, formatted as <code>YYYY-MM-DD</code>
+     */
+    private static String obtainCurrentDate() {
+        // Construct the timestamp we will use
+        Timestamp ts = new Timestamp(System.currentTimeMillis());
+        return ts.toString().substring(0, 10);
+    }
+
+    private void clean() {
+        if (maxDays.intValue() <= 0 || Files.notExists(getDirectoryAsPath())) {
+            return;
+        }
+        DELETE_FILES_SERVICE.submit(() -> {
+            try (DirectoryStream<Path> files = streamFilesForDelete()) {
+                for (Path file : files) {
+                    Files.delete(file);
+                }
+            } catch (IOException ioe) {
+                reportError("Unable to delete log files older than [" + maxDays + "] days", null,
+                        ErrorManager.GENERIC_FAILURE);
+            }
+        });
+    }
+
+    private DirectoryStream<Path> streamFilesForDelete() throws IOException {
+        LocalDate maxDaysOffset = LocalDate.now().minusDays(maxDays.intValue());
+        return Files.newDirectoryStream(getDirectoryAsPath(), path -> {
+            boolean result = false;
+            String date = obtainDateFromPath(path);
+            if (date != null) {
+                try {
+                    LocalDate dateFromFile = LocalDate.from(DateTimeFormatter.ISO_LOCAL_DATE.parse(date));
+                    result = dateFromFile.isBefore(maxDaysOffset);
+                } catch (DateTimeException ignore) {
+                    // Unable to determine date from path. File will not be included.
+                }
+            }
+            return result;
+        });
+    }
+
+    private Path getDirectoryAsPath() {
+        return Path.of(directory);
+    }
+
+    private String obtainDateFromPath(Path path) {
+        Path fileName = path.getFileName();
+        if (fileName == null) {
+            return null;
+        }
+        String date = fileName.toString();
+        if (pattern.matcher(date).matches()) {
+            date = date.substring(prefix.length());
+            return date.substring(0, date.length() - suffix.length());
+        } else {
+            return null;
+        }
+    }
+
+    /**
+     * Thread factory for creating log file cleanup threads.
+     */
+    protected static final class ThreadFactory implements java.util.concurrent.ThreadFactory {
+        private final String namePrefix;
+        private final ThreadGroup group;
+        private final AtomicInteger threadNumber = new AtomicInteger(1);
+
+        /**
+         * Creates a new ThreadFactory with the given name prefix.
+         *
+         * @param namePrefix The name prefix for threads created by this factory
+         */
+        public ThreadFactory(final String namePrefix) {
+            this.namePrefix = namePrefix;
+            this.group = Thread.currentThread().getThreadGroup();
+        }
+
+        @Override
+        public Thread newThread(Runnable r) {
+            Thread t = new Thread(group, r, namePrefix + threadNumber.getAndIncrement());
+            // Threads should not have as context classloader a webapp classloader
+            t.setContextClassLoader(ThreadFactory.class.getClassLoader());
+            t.setDaemon(true);
+            return t;
+        }
+    }
+}

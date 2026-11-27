@@ -1,0 +1,224 @@
+/*
+ *  Licensed to the Apache Software Foundation (ASF) under one or more
+ *  contributor license agreements.  See the NOTICE file distributed with
+ *  this work for additional information regarding copyright ownership.
+ *  The ASF licenses this file to You under the Apache License, Version 2.0
+ *  (the "License"); you may not use this file except in compliance with
+ *  the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ */
+package org.apache.coyote.http11.upgrade;
+
+import java.io.IOException;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import jakarta.servlet.ServletInputStream;
+import jakarta.servlet.ServletOutputStream;
+
+import org.apache.coyote.UpgradeToken;
+import org.apache.juli.logging.Log;
+import org.apache.juli.logging.LogFactory;
+import org.apache.tomcat.util.ExceptionUtils;
+import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
+import org.apache.tomcat.util.net.SSLSupport;
+import org.apache.tomcat.util.net.SocketEvent;
+import org.apache.tomcat.util.net.SocketWrapperBase;
+import org.apache.tomcat.util.res.StringManager;
+
+/**
+ * Upgrade processor for external (Servlet-based) upgrade handlers.
+ */
+public class UpgradeProcessorExternal extends UpgradeProcessorBase {
+
+    private static final Log log = LogFactory.getLog(UpgradeProcessorExternal.class);
+    private static final StringManager sm = StringManager.getManager(UpgradeProcessorExternal.class);
+
+    /**
+     * The input stream for the upgraded connection.
+     */
+    private final UpgradeServletInputStream upgradeServletInputStream;
+
+    /**
+     * The output stream for the upgraded connection.
+     */
+    private final UpgradeServletOutputStream upgradeServletOutputStream;
+
+    /**
+     * Statistics for this upgraded connection.
+     */
+    private final UpgradeInfo upgradeInfo;
+
+    /**
+     * The socket wrapper for the upgraded connection.
+     */
+    private final SocketWrapperBase<?> wrapper;
+
+    private AtomicBoolean stopCalled = new AtomicBoolean();
+
+    /**
+     * Constructs a new UpgradeProcessorExternal.
+     *
+     * @param wrapper          the socket wrapper
+     * @param upgradeToken     the upgrade token
+     * @param upgradeGroupInfo the group info for statistics
+     */
+    public UpgradeProcessorExternal(SocketWrapperBase<?> wrapper, UpgradeToken upgradeToken,
+            UpgradeGroupInfo upgradeGroupInfo) {
+        super(upgradeToken);
+        this.wrapper = wrapper;
+        this.upgradeInfo = new UpgradeInfo();
+        if (upgradeGroupInfo != null) {
+            upgradeInfo.setGroupInfo(upgradeGroupInfo);
+        }
+        this.upgradeServletInputStream = new UpgradeServletInputStream(this, wrapper, upgradeInfo);
+        this.upgradeServletOutputStream = new UpgradeServletOutputStream(this, wrapper, upgradeInfo);
+
+        /*
+         * Leave timeouts in the hands of the upgraded protocol.
+         */
+        wrapper.setReadTimeout(INFINITE_TIMEOUT);
+        wrapper.setWriteTimeout(INFINITE_TIMEOUT);
+    }
+
+
+    @Override
+    protected Log getLog() {
+        return log;
+    }
+
+
+    @Override
+    public void recycle() {
+        // Ensure the connection statistics are always de-registered when the
+        // processor is released by the container. The close() method below
+        // de-registers the statistics as well but it is only triggered if the
+        // application closes the WebConnection, which an upgrade handler is
+        // not required to do.
+        upgradeInfo.setGroupInfo(null);
+    }
+
+
+    // --------------------------------------------------- AutoCloseable methods
+
+    @Override
+    public void close() throws Exception {
+        closeStreamsQuietly();
+        // Triggers update of stats from UpgradeInfo to UpgradeGroupInfo
+        upgradeInfo.setGroupInfo(null);
+        if (stopCalled.compareAndSet(false, true)) {
+            /*
+             * Read polling may have stopped at EOF. Ensure an application thread closing the connection still
+             * triggers socket closure and handler cleanup on a container thread.
+             */
+            wrapper.processSocket(SocketEvent.STOP, true);
+        }
+    }
+
+
+    // --------------------------------------------------- WebConnection methods
+
+    @Override
+    public ServletInputStream getInputStream() throws IOException {
+        return upgradeServletInputStream;
+    }
+
+    @Override
+    public ServletOutputStream getOutputStream() throws IOException {
+        return upgradeServletOutputStream;
+    }
+
+
+    // ------------------------------------------- Implemented Processor methods
+
+    @Override
+    public final SocketState dispatch(SocketEvent status) {
+        if (status == SocketEvent.OPEN_READ) {
+            upgradeServletInputStream.onDataAvailable();
+        } else if (status == SocketEvent.OPEN_WRITE) {
+            upgradeServletOutputStream.onWritePossible();
+        } else if (status == SocketEvent.STOP) {
+            if (log.isTraceEnabled()) {
+                log.trace(sm.getString("upgradeProcessor.stop"));
+            }
+            closeStreamsQuietly();
+            return SocketState.CLOSED;
+        } else if (status == SocketEvent.ERROR) {
+            // Give the listeners (if any) the chance to handle the error before
+            // the connection is closed.
+            Throwable error = wrapper.getError();
+            if (error == null) {
+                error = new IOException(sm.getString("upgradeProcessor.error"));
+            }
+            upgradeServletInputStream.onError(error);
+            upgradeServletOutputStream.onError(error);
+            closeStreamsQuietly();
+            return SocketState.CLOSED;
+        } else {
+            // Unexpected state
+            if (log.isDebugEnabled()) {
+                log.debug(sm.getString("upgradeProcessor.unexpectedState"));
+            }
+            return SocketState.CLOSED;
+        }
+        if (upgradeServletInputStream.isClosed() && upgradeServletOutputStream.isClosed()) {
+            if (log.isTraceEnabled()) {
+                log.trace(sm.getString("upgradeProcessor.requiredClose",
+                        Boolean.valueOf(upgradeServletInputStream.isClosed()),
+                        Boolean.valueOf(upgradeServletOutputStream.isClosed())));
+            }
+            return SocketState.CLOSED;
+        }
+        if (upgradeServletInputStream.isEof()) {
+            /*
+             * Do not re-register read interest after EOF, but allow the output stream to register write interest while
+             * the application finishes its response.
+             */
+            return SocketState.UPGRADED_HALF_CLOSED;
+        }
+        return SocketState.UPGRADED;
+    }
+
+
+    /*
+     * Close the input and output streams if not already closed, logging any exceptions at debug level.
+     */
+    private void closeStreamsQuietly() {
+        try {
+            if (!upgradeServletInputStream.isClosed()) {
+                upgradeServletInputStream.close();
+            }
+        } catch (Throwable t) {
+            ExceptionUtils.handleThrowable(t);
+            log.debug(sm.getString("upgradeProcessor.isCloseFail", t));
+        }
+        try {
+            if (!upgradeServletOutputStream.isClosed()) {
+                upgradeServletOutputStream.close();
+            }
+        } catch (Throwable t) {
+            ExceptionUtils.handleThrowable(t);
+            log.debug(sm.getString("upgradeProcessor.osCloseFail", t));
+        }
+    }
+
+
+    // ----------------------------------------- Unimplemented Processor methods
+
+    @Override
+    public final void setSslSupport(SSLSupport sslSupport) {
+        // NO-OP
+    }
+
+
+    @Override
+    public void pause() {
+        // NOOP
+    }
+}
